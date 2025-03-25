@@ -1,188 +1,251 @@
 import logging
-from flask import Flask, jsonify, request, session
-from flask_mysqldb import MySQL, MySQLdb
+from functools import wraps
+from typing import Dict, Any, Optional
+from flask import Flask, jsonify, request
+from flask_mysqldb import MySQL
+import MySQLdb
 from werkzeug.security import generate_password_hash, check_password_hash
 from flask_cors import CORS
-from datetime import timedelta, datetime
+from datetime import datetime, timedelta
+import jwt
+import os
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 # Initialize Flask app
 app = Flask(__name__)
-app.config['SECRET_KEY'] = 'cairocoders-ednalan'
-app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(minutes=10)
-CORS(app)
+app.config.update({
+    'SECRET_KEY': os.getenv('SECRET_KEY', 'fallback-secret-key'),
+    'JWT_SECRET_KEY': os.getenv('JWT_SECRET_KEY', 'jwt-secret-key'),
+    'JWT_ACCESS_TOKEN_EXPIRES': timedelta(minutes=30),
+    'MYSQL_HOST': os.getenv('MYSQL_HOST', 'localhost'),
+    'MYSQL_USER': os.getenv('MYSQL_USER'),
+    'MYSQL_PASSWORD': os.getenv('MYSQL_PASSWORD'),
+    'MYSQL_DB': os.getenv('MYSQL_DB', 'testingdb'),
+    'MYSQL_CURSORCLASS': 'DictCursor'
+})
 
-# Database configuration
-app.config['MYSQL_HOST'] = 'localhost'
-app.config['MYSQL_USER'] = 'yourusername'
-app.config['MYSQL_PASSWORD'] = 'yourpassword'
-app.config['MYSQL_DB'] = 'testingdb'
-app.config['MYSQL_CURSORCLASS'] = 'DictCursor'
+CORS(app)
 mysql = MySQL(app)
 
-# Setup logging
-logging.basicConfig(level=logging.DEBUG)
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
-def is_valid_latitude(latitude):
-    return -90 <= latitude <= 90
+# Helper Functions
+def create_jwt_token(user_id: str, is_admin: bool = False) -> str:
+    """Generate JWT token for authentication"""
+    payload = {
+        'sub': user_id,
+        'is_admin': is_admin,
+        'iat': datetime.utcnow(),
+        'exp': datetime.utcnow() + app.config['JWT_ACCESS_TOKEN_EXPIRES']
+    }
+    return jwt.encode(payload, app.config['JWT_SECRET_KEY'], algorithm='HS256')
 
-def is_valid_longitude(longitude):
-    return -180 <= longitude <= 180
+def validate_coordinates(latitude: float, longitude: float) -> bool:
+    """Validate geographic coordinates"""
+    return (-90 <= latitude <= 90) and (-180 <= longitude <= 180)
 
-@app.route('/')
-def home():
-    if 'username' in session:
-        username = session['username']
-        return jsonify({'message': 'You are already logged in', 'username': username})
-    else:
-        resp = jsonify({'message': 'Unauthorized'})
-        resp.status_code = 404
-        return resp
+# Decorators
+def token_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        token = None
+        if 'Authorization' in request.headers:
+            token = request.headers['Authorization'].split(" ")[1]
+        
+        if not token:
+            return jsonify({'message': 'Token is missing'}), 401
+            
+        try:
+            data = jwt.decode(token, app.config['JWT_SECRET_KEY'], algorithms=['HS256'])
+            current_user = data['sub']
+            is_admin = data.get('is_admin', False)
+        except jwt.ExpiredSignatureError:
+            return jsonify({'message': 'Token has expired'}), 401
+        except jwt.InvalidTokenError:
+            return jsonify({'message': 'Invalid token'}), 401
+            
+        return f(current_user, is_admin, *args, **kwargs)
+    return decorated
 
-@app.route('/login', methods=['POST'])
+def admin_required(f):
+    @wraps(f)
+    def decorated(current_user, is_admin, *args, **kwargs):
+        if not is_admin:
+            return jsonify({'message': 'Admin access required'}), 403
+        return f(current_user, is_admin, *args, **kwargs)
+    return decorated
+
+# Routes
+@app.route('/api/auth/login', methods=['POST'])
 def login():
+    """Authenticate user and return JWT token"""
     try:
-        _json = request.json
-        _username = _json['username']
-        _password = _json['password']
+        data = request.get_json()
+        if not data or 'username' not in data or 'password' not in data:
+            return jsonify({'message': 'Missing credentials'}), 400
 
-        if _username and _password:
-            cursor = mysql.connection.cursor(MySQLdb.cursors.DictCursor)
-            sql = "SELECT * FROM user WHERE username=%s"
-            cursor.execute(sql, (_username,))
-            row = cursor.fetchone()
-            if row:
-                username = row['username']
-                password = row['password']
-                is_admin = row['is_admin']
-                if check_password_hash(password, _password):
-                    session['username'] = username
-                    session['is_admin'] = is_admin
-                    cursor.close()
-                    return jsonify({'message': 'You are logged in successfully'})
-                else:
-                    resp = jsonify({'message': 'Bad Request - invalid password'})
-                    resp.status_code = 400
-                    return resp
-            else:
-                resp = jsonify({'message': 'Bad Request - user not found'})
-                resp.status_code = 400
-                return resp
-        else:
-            resp = jsonify({'message': 'Bad Request - invalid credentials'})
-            resp.status_code = 400
-            return resp
+        with mysql.connection.cursor(MySQLdb.cursors.DictCursor) as cursor:
+            cursor.execute(
+                "SELECT id, username, password, is_admin FROM user WHERE username=%s",
+                (data['username'],)
+            user = cursor.fetchone()
+
+        if user and check_password_hash(user['password'], data['password']):
+            token = create_jwt_token(user['username'], user['is_admin'])
+            return jsonify({
+                'message': 'Login successful',
+                'token': token,
+                'is_admin': user['is_admin']
+            })
+
+        return jsonify({'message': 'Invalid credentials'}), 401
     except Exception as e:
-        logging.error(f"Error during login: {str(e)}")
-        return jsonify({'message': 'Internal Server Error', 'error': str(e)}), 500
+        logger.error(f"Login error: {str(e)}")
+        return jsonify({'message': 'Internal server error'}), 500
 
-@app.route('/logout')
-def logout():
-    if 'username' in session:
-        session.pop('username', None)
-        session.pop('is_admin', None)
-        return jsonify({'message': 'You successfully logged out'})
-    else:
-        return jsonify({'message': 'No active session'}), 400
+@app.route('/api/attendance/checkin', methods=['POST'])
+@token_required
+def check_in(current_user: str, is_admin: bool):
+    """Record employee check-in with location"""
+    try:
+        data = request.get_json()
+        if not all(key in data for key in ['latitude', 'longitude']):
+            return jsonify({'message': 'Missing location data'}), 400
 
-@app.route('/api/employee/checkin', methods=['POST'])
-def checkin():
-    if 'username' in session:
-        username = session['username']
-        _json = request.json
-        latitude = _json.get('latitude')
-        longitude = _json.get('longitude')
-
-        if not (latitude and longitude):
-            return jsonify({'message': 'Bad Request - missing latitude or longitude'}), 400
-
-        if not is_valid_latitude(latitude):
-            return jsonify({'message': 'Bad Request - invalid latitude'}), 400
-
-        if not is_valid_longitude(longitude):
-            return jsonify({'message': 'Bad Request - invalid longitude'}), 400
+        if not validate_coordinates(data['latitude'], data['longitude']):
+            return jsonify({'message': 'Invalid coordinates'}), 400
 
         check_in_time = datetime.now()
-        if check_in_time > datetime.now():
-            return jsonify({'message': 'Bad Request - future check-in time'}), 400
+        
+        with mysql.connection.cursor(MySQLdb.cursors.DictCursor) as cursor:
+            # Check for existing check-in today
+            cursor.execute(
+                "SELECT id FROM attendance WHERE username=%s AND DATE(check_in_time)=CURDATE()",
+                (current_user,)
+            )
+            if cursor.fetchone():
+                return jsonify({'message': 'Already checked in today'}), 400
 
-        try:
-            cursor = mysql.connection.cursor(MySQLdb.cursors.DictCursor)
-            sql = "SELECT * FROM attendance WHERE username=%s AND DATE(check_in_time) = CURDATE()"
-            cursor.execute(sql, (username,))
-            row = cursor.fetchone()
-            if row:
-                return jsonify({'message': 'Bad Request - check-in already exists for today'}), 400
-
-            sql = "INSERT INTO attendance (username, check_in_time, latitude, longitude) VALUES (%s, %s, %s, %s)"
-            cursor.execute(sql, (username, check_in_time, latitude, longitude))
+            # Record check-in
+            cursor.execute(
+                """INSERT INTO attendance 
+                (username, check_in_time, latitude, longitude) 
+                VALUES (%s, %s, %s, %s)""",
+                (current_user, check_in_time, data['latitude'], data['longitude'])
+            )
             mysql.connection.commit()
-            cursor.close()
-            return jsonify({'message': 'Check-in successful', 'check_in_time': check_in_time.strftime('%Y-%m-%d %H:%M:%S')})
-        except Exception as e:
-            logging.error(f"Error during check-in: {str(e)}")
-            return jsonify({'message': 'Internal Server Error', 'error': str(e)}), 500
-    else:
-        return jsonify({'message': 'Unauthorized'}), 404
 
-@app.route('/api/employee/checkout', methods=['POST'])
-def checkout():
-    if 'username' in session:
-        username = session['username']
+        return jsonify({
+            'message': 'Check-in recorded',
+            'check_in_time': check_in_time.isoformat()
+        }), 201
+
+    except Exception as e:
+        logger.error(f"Check-in error: {str(e)}")
+        return jsonify({'message': 'Internal server error'}), 500
+
+@app.route('/api/attendance/checkout', methods=['POST'])
+@token_required
+def check_out(current_user: str, is_admin: bool):
+    """Record employee check-out"""
+    try:
         check_out_time = datetime.now()
-        if check_out_time > datetime.now():
-            return jsonify({'message': 'Bad Request - future check-out time'}), 400
+        
+        with mysql.connection.cursor(MySQLdb.cursors.DictCursor) as cursor:
+            # Verify existing check-in
+            cursor.execute(
+                """SELECT id FROM attendance 
+                WHERE username=%s AND DATE(check_in_time)=CURDATE() 
+                AND check_out_time IS NULL""",
+                (current_user,)
+            )
+            if not cursor.fetchone():
+                return jsonify({'message': 'No active check-in found'}), 400
 
-        try:
-            cursor = mysql.connection.cursor(MySQLdb.cursors.DictCursor)
-            sql = "SELECT * FROM attendance WHERE username=%s AND DATE(check_in_time) = CURDATE() AND check_out_time IS NULL"
-            cursor.execute(sql, (username,))
-            row = cursor.fetchone()
-            if not row:
-                return jsonify({'message': 'Bad Request - no check-in record found for today'}), 400
-
-            sql = "UPDATE attendance SET check_out_time=%s WHERE username=%s AND check_out_time IS NULL"
-            cursor.execute(sql, (check_out_time, username))
+            # Record check-out
+            cursor.execute(
+                """UPDATE attendance SET check_out_time=%s 
+                WHERE username=%s AND DATE(check_in_time)=CURDATE() 
+                AND check_out_time IS NULL""",
+                (check_out_time, current_user)
+            )
             mysql.connection.commit()
-            cursor.close()
-            return jsonify({'message': 'Check-out successful', 'check_out_time': check_out_time.strftime('%Y-%m-%d %H:%M:%S')})
-        except Exception as e:
-            logging.error(f"Error during check-out: {str(e)}")
-            return jsonify({'message': 'Internal Server Error', 'error': str(e)}), 500
-    else:
-        return jsonify({'message': 'Unauthorized'}), 404
 
-@app.route('/api/employee/attendance', methods=['GET'])
-def employee_attendance():
-    if 'username' in session:
-        username = session['username']
-        try:
-            cursor = mysql.connection.cursor(MySQLdb.cursors.DictCursor)
-            sql = "SELECT * FROM attendance WHERE username=%s"
-            cursor.execute(sql, (username,))
+        return jsonify({
+            'message': 'Check-out recorded',
+            'check_out_time': check_out_time.isoformat()
+        })
+
+    except Exception as e:
+        logger.error(f"Check-out error: {str(e)}")
+        return jsonify({'message': 'Internal server error'}), 500
+
+@app.route('/api/attendance/history', methods=['GET'])
+@token_required
+def attendance_history(current_user: str, is_admin: bool):
+    """Get attendance history for the current user"""
+    try:
+        with mysql.connection.cursor(MySQLdb.cursors.DictCursor) as cursor:
+            cursor.execute(
+                """SELECT 
+                    DATE(check_in_time) as date,
+                    MIN(check_in_time) as check_in,
+                    MAX(check_out_time) as check_out
+                FROM attendance 
+                WHERE username=%s
+                GROUP BY DATE(check_in_time)
+                ORDER BY date DESC
+                LIMIT 30""",
+                (current_user,)
+            )
             records = cursor.fetchall()
-            cursor.close()
-            return jsonify({'message': 'Attendance records fetched successfully', 'records': records})
-        except Exception as e:
-            logging.error(f"Error fetching attendance records: {str(e)}")
-            return jsonify({'message': 'Internal Server Error', 'error': str(e)}), 500
-    else:
-        return jsonify({'message': 'Unauthorized'}), 404
+
+        return jsonify({
+            'message': 'Attendance history retrieved',
+            'data': records
+        })
+
+    except Exception as e:
+        logger.error(f"History error: {str(e)}")
+        return jsonify({'message': 'Internal server error'}), 500
 
 @app.route('/api/admin/attendance', methods=['GET'])
-def admin_attendance():
-    if 'username' in session and session.get('is_admin'):
-        try:
-            cursor = mysql.connection.cursor(MySQLdb.cursors.DictCursor)
-            sql = "SELECT * FROM attendance"
-            cursor.execute(sql)
+@token_required
+@admin_required
+def admin_attendance(current_user: str, is_admin: bool):
+    """Admin endpoint to view all attendance records"""
+    try:
+        with mysql.connection.cursor(MySQLdb.cursors.DictCursor) as cursor:
+            cursor.execute(
+                """SELECT 
+                    u.username,
+                    DATE(a.check_in_time) as date,
+                    MIN(a.check_in_time) as check_in,
+                    MAX(a.check_out_time) as check_out
+                FROM attendance a
+                JOIN user u ON a.username = u.username
+                GROUP BY u.username, DATE(a.check_in_time)
+                ORDER BY date DESC
+                LIMIT 100"""
+            )
             records = cursor.fetchall()
-            cursor.close()
-            return jsonify({'message': 'All attendance records fetched successfully', 'records': records})
-        except Exception as e:
-            logging.error(f"Error fetching all attendance records: {str(e)}")
-            return jsonify({'message': 'Internal Server Error', 'error': str(e)}), 500
-    else:
-        return jsonify({'message': 'Unauthorized'}), 404
 
-if __name__ == "__main__":
-    app.run(debug=True)
+        return jsonify({
+            'message': 'Admin attendance report',
+            'data': records
+        })
+
+    except Exception as e:
+        logger.error(f"Admin report error: {str(e)}")
+        return jsonify({'message': 'Internal server error'}), 500
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000, debug=os.getenv('FLASK_DEBUG', False))
